@@ -1,0 +1,14 @@
+# Build output
+x64/
+Debug/
+Release/
+*.user
+*.suo
+.vs/
+*.aps
+ipch/
+*.ncb
+*.sdf
+*.opensdf
+*.VC.db
+*.VC.opendb
