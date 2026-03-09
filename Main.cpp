@@ -39,8 +39,8 @@ using Microsoft::WRL::ComPtr;
 // Constants
 // ---------------------------------------------------------------------------
 static constexpr UINT FrameCount    = 2;
-static constexpr UINT WinWidth      = 1280;
-static constexpr UINT WinHeight     = 720;
+static constexpr UINT WinWidth      = 1920;
+static constexpr UINT WinHeight     = 1080;
 static constexpr UINT SphereStacks  = 30;
 static constexpr UINT SphereSectors = 50;
 
@@ -736,7 +736,7 @@ static void InitGeometry()
 {
     {
         std::vector<Vertex> v; std::vector<UINT> idx;
-        GenSphere(1.0f, SphereStacks, SphereSectors, v, idx);
+        GenSphere(2.3f, SphereStacks, SphereSectors, v, idx);
         g_sphereIdxCount = static_cast<UINT>(idx.size());
         g_sphereVB = UploadData(v.data(), v.size() * sizeof(Vertex),
                                 D3D12_RESOURCE_STATE_VERTEX_AND_CONSTANT_BUFFER);
@@ -857,7 +857,7 @@ static void Update()
     float dt = static_cast<float>(now.QuadPart - g_prevTime.QuadPart)
                / static_cast<float>(g_freq.QuadPart);
     g_prevTime = now;
-    g_angle += dt * 0.5f;
+    g_angle += dt * 0.05f;
     if (g_angle > XM_2PI) g_angle -= XM_2PI;
 }
 
