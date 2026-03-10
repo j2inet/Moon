@@ -38,11 +38,18 @@ using Microsoft::WRL::ComPtr;
 // ---------------------------------------------------------------------------
 // Constants
 // ---------------------------------------------------------------------------
-static constexpr UINT FrameCount    = 2;
-static constexpr UINT WinWidth      = 1920;
-static constexpr UINT WinHeight     = 1080;
-static constexpr UINT SphereStacks  = 30;
-static constexpr UINT SphereSectors = 50;
+static constexpr UINT FrameCount      = 2;
+static constexpr UINT DefaultWidth    = 1920;
+static constexpr UINT DefaultHeight   = 1080;
+static constexpr UINT SphereStacks    = 30;
+static constexpr UINT SphereSectors   = 50;
+
+// ---------------------------------------------------------------------------
+// Runtime window size (updated on WM_SIZE)
+// ---------------------------------------------------------------------------
+static UINT g_width    = DefaultWidth;
+static UINT g_height   = DefaultHeight;
+static bool g_inResize = false;
 
 // ---------------------------------------------------------------------------
 // Data structures
@@ -546,8 +553,8 @@ static void InitSwapChain()
     HR(CreateDXGIFactory2(0, IID_PPV_ARGS(&fac)));
     DXGI_SWAP_CHAIN_DESC1 sd = {};
     sd.BufferCount      = FrameCount;
-    sd.Width            = WinWidth;
-    sd.Height           = WinHeight;
+    sd.Width            = g_width;
+    sd.Height           = g_height;
     sd.Format           = DXGI_FORMAT_B8G8R8A8_UNORM; // BGRA for D2D compatibility
     sd.BufferUsage      = DXGI_USAGE_RENDER_TARGET_OUTPUT;
     sd.SwapEffect       = DXGI_SWAP_EFFECT_FLIP_DISCARD;
@@ -587,8 +594,8 @@ static void InitHeapsAndBuffers()
         hp.Type = D3D12_HEAP_TYPE_DEFAULT;
         D3D12_RESOURCE_DESC dd = {};
         dd.Dimension        = D3D12_RESOURCE_DIMENSION_TEXTURE2D;
-        dd.Width            = WinWidth;
-        dd.Height           = WinHeight;
+        dd.Width            = g_width;
+        dd.Height           = g_height;
         dd.DepthOrArraySize = 1;
         dd.MipLevels        = 1;
         dd.Format           = DXGI_FORMAT_D32_FLOAT;
@@ -848,6 +855,110 @@ static void InitD2D()
 }
 
 // ---------------------------------------------------------------------------
+// Resize helpers
+// ---------------------------------------------------------------------------
+
+// Rebuilds all resources that depend on the swap chain dimensions.
+// Call only after WaitGPU() and after updating g_width/g_height.
+static void RecreateSizeDependentResources()
+{
+    // Release back-buffer references, depth buffer, and D2D/D3D11On12 objects
+    // that wrap the old back buffers.
+    for (UINT i = 0; i < FrameCount; ++i)
+    {
+        g_d2dRT[i].Reset();
+        g_wrapped[i].Reset();
+        g_bb[i].Reset();
+    }
+    g_depth.Reset();
+
+    // Resize swap chain buffers (keep same format and count).
+    HR(g_sc->ResizeBuffers(FrameCount, g_width, g_height,
+                           DXGI_FORMAT_B8G8R8A8_UNORM, 0));
+    g_frame = g_sc->GetCurrentBackBufferIndex();
+
+    // Recreate RTVs (reuse existing RTV heap).
+    {
+        D3D12_CPU_DESCRIPTOR_HANDLE rtvH =
+            g_rtvHeap->GetCPUDescriptorHandleForHeapStart();
+        for (UINT i = 0; i < FrameCount; ++i)
+        {
+            HR(g_sc->GetBuffer(i, IID_PPV_ARGS(&g_bb[i])));
+            g_dev->CreateRenderTargetView(g_bb[i].Get(), nullptr, rtvH);
+            rtvH.ptr += g_rtvInc;
+        }
+    }
+
+    // Recreate depth buffer and DSV (reuse existing DSV heap).
+    {
+        D3D12_HEAP_PROPERTIES hp = {};
+        hp.Type = D3D12_HEAP_TYPE_DEFAULT;
+
+        D3D12_RESOURCE_DESC dd = {};
+        dd.Dimension        = D3D12_RESOURCE_DIMENSION_TEXTURE2D;
+        dd.Width            = g_width;
+        dd.Height           = g_height;
+        dd.DepthOrArraySize = 1;
+        dd.MipLevels        = 1;
+        dd.Format           = DXGI_FORMAT_D32_FLOAT;
+        dd.SampleDesc.Count = 1;
+        dd.Flags            = D3D12_RESOURCE_FLAG_ALLOW_DEPTH_STENCIL;
+
+        D3D12_CLEAR_VALUE cv = {};
+        cv.Format             = DXGI_FORMAT_D32_FLOAT;
+        cv.DepthStencil.Depth = 1.0f;
+
+        HR(g_dev->CreateCommittedResource(&hp, D3D12_HEAP_FLAG_NONE, &dd,
+                                          D3D12_RESOURCE_STATE_DEPTH_WRITE,
+                                          &cv, IID_PPV_ARGS(&g_depth)));
+
+        D3D12_DEPTH_STENCIL_VIEW_DESC dv = {};
+        dv.Format        = DXGI_FORMAT_D32_FLOAT;
+        dv.ViewDimension = D3D12_DSV_DIMENSION_TEXTURE2D;
+
+        g_dev->CreateDepthStencilView(
+            g_depth.Get(), &dv,
+            g_dsvHeap->GetCPUDescriptorHandleForHeapStart());
+    }
+
+    // Recreate D3D11On12 wrapped resources and D2D bitmaps for each frame.
+    D2D1_BITMAP_PROPERTIES1 bp = {};
+    bp.pixelFormat  = D2D1::PixelFormat(DXGI_FORMAT_UNKNOWN,
+                                        D2D1_ALPHA_MODE_PREMULTIPLIED);
+    bp.dpiX = bp.dpiY = 96.0f;
+    bp.bitmapOptions  = D2D1_BITMAP_OPTIONS_TARGET |
+                        D2D1_BITMAP_OPTIONS_CANNOT_DRAW;
+
+    for (UINT i = 0; i < FrameCount; ++i)
+    {
+        D3D11_RESOURCE_FLAGS f11 = { D3D11_BIND_RENDER_TARGET };
+        HR(g_11on12->CreateWrappedResource(
+            g_bb[i].Get(), &f11,
+            D3D12_RESOURCE_STATE_RENDER_TARGET,
+            D3D12_RESOURCE_STATE_PRESENT,
+            IID_PPV_ARGS(&g_wrapped[i])));
+
+        ComPtr<IDXGISurface> surf;
+        HR(g_wrapped[i].As(&surf));
+        HR(g_d2dCtx->CreateBitmapFromDxgiSurface(surf.Get(), &bp,
+                                                  &g_d2dRT[i]));
+    }
+}
+
+static void OnResize(UINT w, UINT h)
+{
+    if (w == 0 || h == 0) return; // ignore minimized
+
+    if (w == g_width && h == g_height) return; // no real change
+
+    g_width  = w;
+    g_height = h;
+
+    WaitGPU();
+    RecreateSizeDependentResources();
+}
+
+// ---------------------------------------------------------------------------
 // Per-frame update
 // ---------------------------------------------------------------------------
 static void Update()
@@ -872,7 +983,7 @@ static void Render()
         XMVectorSet(0.0f, 1.0f, 0.0f, 0.0f));
     XMMATRIX proj = XMMatrixPerspectiveFovLH(
         XMConvertToRadians(45.0f),
-        static_cast<float>(WinWidth) / WinHeight,
+        static_cast<float>(g_width) / static_cast<float>(g_height),
         0.1f, 100.0f);
     XMMATRIX vp         = XMMatrixMultiply(view, proj);
     XMMATRIX sphereWorld = XMMatrixRotationY(g_angle);
@@ -904,11 +1015,11 @@ static void Render()
     g_cl->ResourceBarrier(1, &barrier);
 
     D3D12_VIEWPORT viewport = { 0, 0,
-                                static_cast<float>(WinWidth),
-                                static_cast<float>(WinHeight), 0.0f, 1.0f };
+                                static_cast<float>(g_width),
+                                static_cast<float>(g_height), 0.0f, 1.0f };
     D3D12_RECT sc = { 0, 0,
-                      static_cast<LONG>(WinWidth),
-                      static_cast<LONG>(WinHeight) };
+                      static_cast<LONG>(g_width),
+                      static_cast<LONG>(g_height) };
     g_cl->RSSetViewports(1, &viewport);
     g_cl->RSSetScissorRects(1, &sc);
 
@@ -996,6 +1107,22 @@ static LRESULT CALLBACK WndProc(HWND hwnd, UINT msg, WPARAM wp, LPARAM lp)
 {
     switch (msg)
     {
+    case WM_SIZE:
+    {
+        if (g_inResize) break;
+        g_inResize = true;
+
+        if (g_sc)
+        {
+            RECT cr = {};
+            GetClientRect(hwnd, &cr);
+            OnResize(static_cast<UINT>(cr.right  - cr.left),
+                     static_cast<UINT>(cr.bottom - cr.top));
+        }
+
+        g_inResize = false;
+        return 0;
+    }
     case WM_DESTROY:
         PostQuitMessage(0);
         return 0;
@@ -1023,8 +1150,8 @@ int WINAPI wWinMain(HINSTANCE hInst, HINSTANCE, PWSTR, int nCmdShow)
     RegisterClassExW(&wc);
 
     RECT r = { 0, 0,
-               static_cast<LONG>(WinWidth),
-               static_cast<LONG>(WinHeight) };
+               static_cast<LONG>(DefaultWidth),
+               static_cast<LONG>(DefaultHeight) };
     AdjustWindowRect(&r, WS_OVERLAPPEDWINDOW, FALSE);
     g_hwnd = CreateWindowExW(
         0, L"MoonDemoClass", L"Moon Demo",
@@ -1032,6 +1159,16 @@ int WINAPI wWinMain(HINSTANCE hInst, HINSTANCE, PWSTR, int nCmdShow)
         CW_USEDEFAULT, CW_USEDEFAULT,
         r.right - r.left, r.bottom - r.top,
         nullptr, nullptr, hInst, nullptr);
+
+    // Capture the actual client size (may differ from requested due to DPI/adjustments).
+    {
+        RECT cr = {};
+        GetClientRect(g_hwnd, &cr);
+        g_width  = static_cast<UINT>(cr.right  - cr.left);
+        g_height = static_cast<UINT>(cr.bottom - cr.top);
+        if (g_width  == 0) g_width  = DefaultWidth;
+        if (g_height == 0) g_height = DefaultHeight;
+    }
 
     try
     {
